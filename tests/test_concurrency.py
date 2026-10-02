@@ -3,13 +3,14 @@ import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from app.models import DenialReason, Role
+from app.models import DenialReason
+from tests.conftest import do_login
 
 log = logging.getLogger("verify.concurrency")
 
 
 def test_concurrent_refresh_only_one_succeeds(auth):
-    s = auth.login("alice", Role.OWNER)
+    s = do_login(auth, "alice")
     old_token = s.token
     n = 16
     barrier = threading.Barrier(n)
@@ -33,7 +34,7 @@ def test_concurrent_refresh_only_one_succeeds(auth):
 
 
 def test_old_token_replay_after_refresh(auth):
-    s = auth.login("alice", Role.OWNER)
+    s = do_login(auth, "alice")
     old_token = s.token
     auth.refresh(old_token)
     d = auth.refresh(old_token)  # 重放旧凭据再次刷新
@@ -42,7 +43,7 @@ def test_old_token_replay_after_refresh(auth):
 
 
 def test_protected_write_rejections_make_no_change(auth):
-    s = auth.login("alice", Role.OWNER)
+    s = do_login(auth, "alice")
     marker = []
     d = auth.update_session(s.token, None, None, lambda sess: marker.append(1))
     log.info("request=update(csrf=None) reason=%s", d.reason)
@@ -57,8 +58,24 @@ def test_protected_write_rejections_make_no_change(auth):
     assert d.reason is DenialReason.VERSION_CONFLICT and not marker
 
 
+def test_protected_write_success_and_visible_afterwards(auth):
+    """合法写入必须真正生效，后续读取能看到新内容（不只覆盖拒绝分支）。"""
+    s = do_login(auth, "alice")
+    d = auth.update_session(
+        s.token, s.csrf_token, s.version,
+        lambda sess: setattr(sess, "note", "hello"),
+    )
+    log.info("request=update(valid) allowed=%s detail=%s", d.allowed, d.detail)
+    assert d.allowed
+
+    after = auth.get_active_session(s.token)
+    log.info("request=read(after write) note=%r version=%s", getattr(after, "note", None), after.version)
+    assert after.note == "hello"
+    assert after.version == s.version  # 同一对象，版本已在写入时 +1
+
+
 def test_concurrent_updates_no_lost_writes(auth):
-    s = auth.login("alice", Role.OWNER)
+    s = do_login(auth, "alice")
     n = 32
     barrier = threading.Barrier(n)
 
@@ -81,7 +98,7 @@ def test_concurrent_updates_no_lost_writes(auth):
 
 def test_optimistic_version_conflict_under_concurrency(auth):
     """两个请求读到同一版本，只有一个能写入，另一个得到 VERSION_CONFLICT。"""
-    s = auth.login("alice", Role.OWNER)
+    s = do_login(auth, "alice")
     base_version = s.version
     barrier = threading.Barrier(2)
 

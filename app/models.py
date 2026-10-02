@@ -35,6 +35,15 @@ class DenialReason(enum.Enum):
     CSRF_MISSING = "csrf_missing"
     CSRF_MISMATCH = "csrf_mismatch"
     VERSION_CONFLICT = "version_conflict"
+    # 登录认证
+    ACCOUNT_UNKNOWN = "account_unknown"
+    PASSWORD_MISMATCH = "password_mismatch"
+    ACCOUNT_DISABLED = "account_disabled"
+    ACCOUNT_LOCKED = "account_locked"
+    # 账号状态变化导致的会话失效
+    SESSION_INVALIDATED = "session_invalidated"
+    # 续期总时长上限
+    SESSION_MAX_AGE_EXCEEDED = "session_max_age_exceeded"
 
 
 @dataclass(frozen=True)
@@ -56,7 +65,11 @@ class Decision:
 
 @dataclass
 class Session:
-    """服务端会话记录。version 用于乐观并发控制。"""
+    """服务端会话记录。version 用于乐观并发控制。
+
+    created_at 为登录时刻（续期总时长上限的基准）；
+    account_epoch 为签发时账号的凭据纪元，账号停用/改密后纪元变化即失效。
+    """
 
     session_id: str
     user_id: str
@@ -66,9 +79,23 @@ class Session:
     expires_at: float
     revoked: bool = False
     version: int = 0
+    created_at: float = 0.0
+    account_epoch: int = 0
 
 
-@dataclass(frozen=True)
+@dataclass
+class Account:
+    """本地账号。口令只保存加盐散列；epoch 在停用或改密时递增。"""
+
+    username: str
+    password_hash: str
+    salt: str
+    role: Role
+    enabled: bool = True
+    epoch: int = 0
+
+
+@dataclass
 class Resource:
     """受保护资源。visibility: public 任何登录角色可读，private 仅所有者与管理员。"""
 

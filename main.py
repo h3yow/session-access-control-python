@@ -1,7 +1,9 @@
-"""FastAPI 路由层：登录、刷新、撤销、受保护读写。
+"""FastAPI 路由层：本地账号登录、刷新、撤销、账号状态管理、受保护读写。
 
 拒绝响应统一形如 {"allowed": false, "reason": <DenialReason.value>, "detail": ...}，
 不同的凭据/权限/保护失败在 HTTP 层依旧可区分（401 认证失败 / 403 权限或保护失败 / 409 版本冲突）。
+
+演示用本地账号全部为假口令，仅用于本地验证，不是真实生产凭据。
 """
 from __future__ import annotations
 
@@ -11,12 +13,21 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from app.access import can_read, can_write
+from app.accounts import AccountStore
 from app.auth import AuthService
 from app.models import DenialReason, Resource, Role
 
 app = FastAPI(title="session-access-control")
 
-auth = AuthService(ttl_seconds=300.0)
+# 演示用本地账号（假口令），角色由账号决定，登录请求不能自选角色。
+accounts = AccountStore(max_failures=3, lockout_seconds=30.0)
+accounts.add_account("alice", "alice-pw", Role.OWNER)
+accounts.add_account("bob", "bob-pw", Role.OWNER)
+accounts.add_account("carol", "carol-pw", Role.VIEWER)
+accounts.add_account("root", "root-pw", Role.ADMIN)
+accounts.add_account("dave", "dave-pw", Role.VIEWER, enabled=False)
+
+auth = AuthService(accounts, ttl_seconds=300.0, max_lifetime_seconds=1800.0)
 
 # 演示用本地数据，不依赖任何外部服务。
 _resources: dict[str, Resource] = {
@@ -27,8 +38,12 @@ _resources: dict[str, Resource] = {
 
 
 class LoginBody(BaseModel):
-    user_id: str
-    role: Role
+    username: str
+    password: str
+
+
+class PasswordBody(BaseModel):
+    new_password: str
 
 
 class NoteBody(BaseModel):
@@ -43,12 +58,18 @@ class ResourceBody(BaseModel):
 
 
 def _deny_http(reason: DenialReason, detail: str) -> HTTPException:
-    # 401：凭据认证类失败；403：权限/保护信息失败；409：乐观版本冲突。
+    # 401：凭据/账号认证类失败；403：权限/保护信息失败；409：乐观版本冲突。
     if reason in (
         DenialReason.SESSION_NOT_FOUND,
         DenialReason.SESSION_EXPIRED,
         DenialReason.TOKEN_ROTATED,
         DenialReason.SESSION_REVOKED,
+        DenialReason.SESSION_INVALIDATED,
+        DenialReason.SESSION_MAX_AGE_EXCEEDED,
+        DenialReason.ACCOUNT_UNKNOWN,
+        DenialReason.PASSWORD_MISMATCH,
+        DenialReason.ACCOUNT_DISABLED,
+        DenialReason.ACCOUNT_LOCKED,
     ):
         status = 401
     elif reason is DenialReason.VERSION_CONFLICT:
@@ -58,9 +79,7 @@ def _deny_http(reason: DenialReason, detail: str) -> HTTPException:
     return HTTPException(status_code=status, detail={"allowed": False, "reason": reason.value, "detail": detail})
 
 
-@app.post("/login")
-def login(body: LoginBody):
-    session = auth.login(body.user_id, body.role)
+def _session_view(session) -> dict:
     return {
         "allowed": True,
         "session_id": session.session_id,
@@ -73,6 +92,14 @@ def login(body: LoginBody):
     }
 
 
+@app.post("/login")
+def login(body: LoginBody):
+    decision, session = auth.login(body.username, body.password)
+    if not decision.allowed:
+        raise _deny_http(decision.reason, decision.detail)
+    return _session_view(session)
+
+
 @app.post("/refresh")
 def refresh(x_auth_token: Optional[str] = Header(default=None)):
     if not x_auth_token:
@@ -80,19 +107,30 @@ def refresh(x_auth_token: Optional[str] = Header(default=None)):
     decision, session = auth.refresh(x_auth_token)
     if not decision.allowed:
         raise _deny_http(decision.reason, decision.detail)
-    return {
-        "allowed": True,
-        "session_id": session.session_id,
-        "token": session.token,
-        "csrf_token": session.csrf_token,
-        "expires_at": session.expires_at,
-        "version": session.version,
-    }
+    return _session_view(session)
 
 
 @app.post("/revoke/{session_id}")
 def revoke(session_id: str):
     decision = auth.revoke(session_id)
+    if not decision.allowed:
+        raise _deny_http(decision.reason, decision.detail)
+    return {"allowed": True, "detail": decision.detail}
+
+
+@app.post("/accounts/{username}/disable")
+def disable_account(username: str):
+    """停用账号：该账号既有会话全部立即失效（session_invalidated）。"""
+    decision = accounts.set_enabled(username, False)
+    if not decision.allowed:
+        raise _deny_http(decision.reason, decision.detail)
+    return {"allowed": True, "detail": decision.detail}
+
+
+@app.post("/accounts/{username}/password")
+def change_password(username: str, body: PasswordBody):
+    """修改口令：该账号既有会话全部立即失效（session_invalidated）。"""
+    decision = accounts.change_password(username, body.new_password)
     if not decision.allowed:
         raise _deny_http(decision.reason, decision.detail)
     return {"allowed": True, "detail": decision.detail}
