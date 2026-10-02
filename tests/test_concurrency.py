@@ -3,13 +3,14 @@ import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from app.models import DenialReason, Role
+from app.models import DenialReason
 
 log = logging.getLogger("verify.concurrency")
 
 
 def test_concurrent_refresh_only_one_succeeds(auth):
-    s = auth.login("alice", Role.OWNER)
+    ok, s = auth.login("alice", "alice-pw")
+    assert ok.allowed
     old_token = s.token
     n = 16
     barrier = threading.Barrier(n)
@@ -33,7 +34,8 @@ def test_concurrent_refresh_only_one_succeeds(auth):
 
 
 def test_old_token_replay_after_refresh(auth):
-    s = auth.login("alice", Role.OWNER)
+    ok, s = auth.login("alice", "alice-pw")
+    assert ok.allowed
     old_token = s.token
     auth.refresh(old_token)
     d = auth.refresh(old_token)  # 重放旧凭据再次刷新
@@ -42,7 +44,8 @@ def test_old_token_replay_after_refresh(auth):
 
 
 def test_protected_write_rejections_make_no_change(auth):
-    s = auth.login("alice", Role.OWNER)
+    ok, s = auth.login("alice", "alice-pw")
+    assert ok.allowed
     marker = []
     d = auth.update_session(s.token, None, None, lambda sess: marker.append(1))
     log.info("request=update(csrf=None) reason=%s", d.reason)
@@ -58,7 +61,8 @@ def test_protected_write_rejections_make_no_change(auth):
 
 
 def test_concurrent_updates_no_lost_writes(auth):
-    s = auth.login("alice", Role.OWNER)
+    ok, s = auth.login("alice", "alice-pw")
+    assert ok.allowed
     n = 32
     barrier = threading.Barrier(n)
 
@@ -81,7 +85,8 @@ def test_concurrent_updates_no_lost_writes(auth):
 
 def test_optimistic_version_conflict_under_concurrency(auth):
     """两个请求读到同一版本，只有一个能写入，另一个得到 VERSION_CONFLICT。"""
-    s = auth.login("alice", Role.OWNER)
+    ok, s = auth.login("alice", "alice-pw")
+    assert ok.allowed
     base_version = s.version
     barrier = threading.Barrier(2)
 
@@ -99,3 +104,30 @@ def test_optimistic_version_conflict_under_concurrency(auth):
 
     assert sum(1 for d in results if d.allowed) == 1
     assert sum(1 for d in results if d.reason is DenialReason.VERSION_CONFLICT) == 1
+
+
+def test_protected_write_positive_takes_effect_and_reads_back(auth):
+    """正向分支：CSRF 与版本都正确时写入必须真正生效，随后能读到新内容。"""
+    ok, s = auth.login("alice", "alice-pw")
+    assert ok.allowed
+
+    d1 = auth.update_session(
+        s.token, s.csrf_token, s.version,
+        lambda sess: setattr(sess, "profile", {"city": "Shanghai"}),
+    )
+    log.info("request=update(valid v=%d) allowed=%s detail=%s", s.version, d1.allowed, d1.detail)
+    assert d1.allowed
+
+    live = auth.get_active_session(s.token)
+    log.info("readback profile=%s version=%s", getattr(live, "profile", None), live.version)
+    assert live.version == 1 and live.profile == {"city": "Shanghai"}
+
+    # 带新版本号的第二次写入同样成功且读回一致。
+    d2 = auth.update_session(
+        s.token, s.csrf_token, 1,
+        lambda sess: sess.profile.update({"role_hint": "owner"}),
+    )
+    log.info("request=update(valid v=1) allowed=%s detail=%s", d2.allowed, d2.detail)
+    assert d2.allowed
+    live2 = auth.get_active_session(s.token)
+    assert live2.version == 2 and live2.profile == {"city": "Shanghai", "role_hint": "owner"}

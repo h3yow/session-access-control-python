@@ -11,7 +11,8 @@ log = logging.getLogger("verify.access")
 def make_session(user_id: str, role: Role) -> Session:
     return Session(
         session_id="s", user_id=user_id, role=role,
-        token="t", csrf_token="c", expires_at=float("inf"),
+        token="t", csrf_token="c",
+        expires_at=float("inf"), absolute_expires_at=float("inf"),
     )
 
 
