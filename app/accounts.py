@@ -10,9 +10,14 @@
 
 口令只保存 PBKDF2 加盐散列，比较使用恒定时间比较。
 账号停用/启用、修改口令都会递增 epoch，供会话层检测"账号状态变化"。
+
+并发模型：仓库使用可重入锁（RLock），并通过 lock 属性暴露给会话层，
+使"认证 + 签发会话"能与"停用/改密"在同一把锁内串行——状态切换一旦返回，
+之后完成的登录不可能再拿到可用会话（见 auth.AuthService.login）。
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import hmac
 import secrets
@@ -34,8 +39,9 @@ def _hash_password(password: str, salt: str) -> str:
 class AccountStore:
     """内存账号仓库。
 
-    并发模型：认证、失败计数、锁定与状态变更都在同一把锁内完成，
+    并发模型：认证、失败计数、锁定与状态变更都在同一把可重入锁内完成，
     并发登录失败不会少算次数，锁定判定也不会因并发而多放行。
+    锁通过 lock 属性共享给会话层，保证登录签发与状态切换互斥。
     """
 
     def __init__(
@@ -44,13 +50,18 @@ class AccountStore:
         lockout_seconds: float = 60.0,
         clock: Callable[[], float] = None,
     ):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._accounts: dict[str, Account] = {}
         self._failures: dict[str, int] = {}
         self._locked_until: dict[str, float] = {}
         self._max_failures = max_failures
         self._lockout_seconds = lockout_seconds
         self._clock = clock or time.monotonic
+
+    @property
+    def lock(self) -> threading.RLock:
+        """账号状态锁。会话层在"认证 + 签发会话"期间持有它，与停用/改密互斥。"""
+        return self._lock
 
     # ---- 内部：须在持锁状态下调用 ----
 
@@ -103,7 +114,11 @@ class AccountStore:
     # ---- 认证 ----
 
     def authenticate(self, username: str, password: str) -> tuple[Decision, Optional[Account]]:
-        """校验口令并做失败限流；成功时原子地返回账号快照（角色/epoch 与判定一致）。"""
+        """校验口令并做失败限流；成功时返回判定时刻的账号不可变快照。
+
+        返回的是副本而非仓库内的可变对象：调用方随后读到的角色/纪元
+        一定与本次判定一致，不会观察到状态切换的中间值。
+        """
         with self._lock:
             account = self._accounts.get(username)
             if account is None:
@@ -132,4 +147,4 @@ class AccountStore:
                     f"口令不匹配（第 {failures}/{self._max_failures} 次）",
                 ), None
             self._reset_throttle_locked(username)
-            return Decision.allow("认证通过"), account
+            return Decision.allow("认证通过"), dataclasses.replace(account)

@@ -11,6 +11,10 @@
 - ADMIN   : 可写任意资源
 - OWNER   : 仅可写自有资源，否则拒绝(NOT_OWNER)
 - VIEWER  : 任何资源都不可写，拒绝(FORBIDDEN_ROLE)
+
+账号管理（停用/启用、修改口令）：
+- 仅 ADMIN 可执行，其他角色拒绝(FORBIDDEN_ROLE)；
+  未登录在路由层以 SESSION_NOT_FOUND 拒绝，二者可区分。
 """
 from __future__ import annotations
 
@@ -52,4 +56,14 @@ def can_write(session: Session, resource: Resource) -> Decision:
     return Decision.deny(
         DenialReason.FORBIDDEN_ROLE,
         f"查看者无权写资源 {resource.resource_id}",
+    )
+
+
+def can_manage_accounts(session: Session) -> Decision:
+    """账号管理操作（停用/启用、修改口令）仅管理员可执行。"""
+    if session.role is Role.ADMIN:
+        return Decision.allow("管理员可执行账号管理操作")
+    return Decision.deny(
+        DenialReason.FORBIDDEN_ROLE,
+        f"角色 {session.role.value} 无权执行账号管理操作（需要 admin）",
     )

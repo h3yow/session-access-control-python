@@ -8,9 +8,9 @@
 
 ```
 app/models.py    # Role / DenialReason / Session / Account / Resource / Decision
-app/accounts.py  # AccountStore：本地账号、口令校验、失败限流锁定、停用/改密
+app/accounts.py  # AccountStore：本地账号、口令校验、失败限流锁定、停用/改密（状态锁与会话层共享）
 app/auth.py      # AuthService：登录、校验、刷新轮换、撤销、失效联动、受保护写操作
-app/access.py    # can_read / can_write：基于角色的资源访问判定（纯函数）
+app/access.py    # can_read / can_write / can_manage_accounts：角色访问判定（纯函数）
 main.py          # FastAPI 路由层（HTTP 演示，含演示用本地账号）
 tests/           # 生命周期、账号登录、失效联动、续期上限、访问矩阵、并发、HTTP 端到端
 ```
@@ -53,6 +53,35 @@ tests/           # 生命周期、账号登录、失效联动、续期上限、�
 - 会话级状态优先于凭据级状态：停用后即使凭据已轮换/已过期，也报 `session_invalidated`；
 - 状态切换与并发请求同时发生时，所有判定都在锁内完成：切换完成后不允许再有请求漏网成功
   （见 `test_invalidation.py::test_concurrent_disable_no_request_slips_through`）。
+
+### 与并发登录的竞态处理
+
+会话层与账号仓库**共用同一把可重入锁**：`login` 的"口令认证 + 签发会话"与
+`set_enabled` / `change_password` 的状态切换互斥。因此停用/改密一旦返回成功：
+
+- 之后**完成**的登录要么在认证阶段就被拒绝（`account_disabled` / `password_mismatch`），
+  要么根本没机会进入签发——不存在"认证通过后、签发前状态被切换"的窗口；
+- 竞争中已签发的会话（切换之前完成登录的）随 `epoch` 递增全部失效，
+  访问与续期统一报 `session_invalidated`。
+
+此外 `authenticate` 成功时返回的是判定时刻的**账号快照**（副本），而非仓库内的可变对象：
+即使状态切换恰好落在认证与签发之间，会话也只能以认证时刻的旧纪元签发，必然失效——
+这是锁之外的第二道防线。两组场景都有确定性复现用例
+（`test_disable_landing_between_authenticate_and_issue` /
+`test_password_change_landing_between_authenticate_and_issue`，
+通过在认证返回后注入状态切换来精确构造窗口）以及并发风暴用例
+（`test_concurrent_login_and_disable_no_usable_session_survives` /
+`test_concurrent_old_password_login_and_password_change`）。
+
+### 账号管理操作的权限要求
+
+停用/启用、修改口令属于管理操作，**只有已登录且角色为 `admin` 的账号才能执行**
+（`access.can_manage_accounts`）：
+
+- 未携带凭据 / 凭据无效 → `401 session_not_found`（或其他凭据类原因）；
+- 已登录但角色不足（owner / viewer）→ `403 forbidden_role`；
+- 两类拒绝在 `reason` 与 HTTP 状态码上都可区分；
+- 越权尝试不会产生任何副作用（见 `test_api.py::test_http_account_management_requires_admin_role`）。
 
 ## 会话生命周期与续期总时长上限
 
@@ -107,7 +136,7 @@ tests/           # 生命周期、账号登录、失效联动、续期上限、�
 | `session_revoked` | 凭据所在会话已被撤销 | 401 |
 | `session_invalidated` | 账号停用/改密导致会话被强制失效 | 401 |
 | `session_max_age_exceeded` | 续期总时长已达上限，禁止续期 | 401 |
-| `forbidden_role` | 角色能力不足（如 viewer 访问 private / 执行写） | 403 |
+| `forbidden_role` | 角色能力不足（如 viewer 访问 private / 执行写 / 执行账号管理操作） | 403 |
 | `not_owner` | 非管理员且不是目标资源的所有者 | 403 |
 | `csrf_missing` | 写操作缺少保护信息 | 403 |
 | `csrf_mismatch` | 保护信息与会话当前值不匹配（含轮换后使用旧 csrf） | 403 |
@@ -143,13 +172,17 @@ curl -s -X POST localhost:8000/login -H 'content-type: application/json' \
 # 连续 3 次错误口令后，正确口令也会被锁定 30s -> 401 account_locked
 curl -s -X POST localhost:8000/login -H 'content-type: application/json' \
   -d '{"username":"alice","password":"wrong"}'
-# 停用账号后，既有会话访问/续期 -> 401 session_invalidated
-curl -s -X POST localhost:8000/accounts/alice/disable
-# 修改口令同样使既有会话失效
-curl -s -X POST localhost:8000/accounts/alice/password \
-  -H 'content-type: application/json' -d '{"new_password":"new-pw"}'
 # 刷新（携带登录返回的 token）；旧 token 重放 -> 401 token_rotated
 curl -s -X POST localhost:8000/refresh -H "x-auth-token: <token>"
+
+# 账号管理操作需要 admin 凭据（root / root-pw）：
+# 未携带凭据 -> 401 session_not_found；非 admin -> 403 forbidden_role
+curl -s -X POST localhost:8000/accounts/alice/disable
+# admin 停用账号后，既有会话访问/续期 -> 401 session_invalidated
+curl -s -X POST localhost:8000/accounts/alice/disable -H "x-auth-token: <root-token>"
+# admin 修改口令同样使既有会话失效；旧口令之后不能再登录
+curl -s -X POST localhost:8000/accounts/alice/password -H "x-auth-token: <root-token>" \
+  -H 'content-type: application/json' -d '{"new_password":"new-pw"}'
 ```
 
 测试日志中每个用例都会打印**请求输入**（用户、角色、资源、操作编号、时间推进）与

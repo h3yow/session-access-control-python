@@ -2,7 +2,7 @@
 import logging
 from concurrent.futures import ThreadPoolExecutor
 
-from app.access import can_read, can_write
+from app.access import can_manage_accounts, can_read, can_write
 from app.models import DenialReason, Resource, Role, Session
 
 log = logging.getLogger("verify.access")
@@ -62,3 +62,18 @@ def test_decision_independent_of_order_and_concurrency():
         base = sequential[i % len(cases)]
         assert (d.allowed, d.reason) == (base.allowed, base.reason)
     log.info("concurrent read decisions consistent across %d evaluations", len(concurrent))
+
+
+def test_account_management_matrix():
+    """停用/改口令等账号管理操作仅 admin 可执行，其余角色以 forbidden_role 拒绝。"""
+    for user, role, ok in (
+        ("root", Role.ADMIN, True),
+        ("alice", Role.OWNER, False),
+        ("carol", Role.VIEWER, False),
+    ):
+        d = can_manage_accounts(make_session(user, role))
+        log.info("request=manage_accounts(user=%s role=%s) allowed=%s reason=%s detail=%s",
+                 user, role.value, d.allowed, d.reason, d.detail)
+        assert d.allowed is ok
+        if not ok:
+            assert d.reason is DenialReason.FORBIDDEN_ROLE

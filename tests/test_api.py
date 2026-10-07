@@ -120,8 +120,9 @@ def test_http_protected_write_csrf():
 
 
 def test_http_account_disable_invalidates_session():
+    admin = login("root")
     sess = login("bob")
-    r = client.post("/accounts/bob/disable")
+    r = client.post("/accounts/bob/disable", headers={"x-auth-token": admin["token"]})
     assert r.status_code == 200
     r2 = client.get("/resource/r-bob", headers={"x-auth-token": sess["token"]})
     body = r2.json()["detail"]
@@ -131,6 +132,72 @@ def test_http_account_disable_invalidates_session():
     log.info("request=refresh(after disable) reason=%s", r3.json()["detail"]["reason"])
     assert r3.json()["detail"]["reason"] == "session_invalidated"
     # 恢复，避免影响其他用例
-    client.post("/accounts/bob/disable")  # 幂等再次调用无副作用
     from main import accounts as store
     store.set_enabled("bob", True)
+
+
+def test_http_account_management_requires_login():
+    """未登录调用停用/改口令：401 session_not_found，与权限不足可区分。"""
+    for desc, r in (
+        ("disable", client.post("/accounts/alice/disable")),
+        ("password", client.post("/accounts/alice/password", json={"new_password": "x"})),
+    ):
+        body = r.json()["detail"]
+        log.info("request=%s(no token) status=%s reason=%s", desc, r.status_code, body["reason"])
+        assert r.status_code == 401 and body["reason"] == "session_not_found"
+
+
+def test_http_account_management_requires_admin_role():
+    """已登录但非 admin：403 forbidden_role；且操作不得生效。"""
+    for who in ("alice", "carol"):  # owner / viewer 都不够权限
+        sess = login(who)
+        r = client.post("/accounts/bob/disable", headers={"x-auth-token": sess["token"]})
+        body = r.json()["detail"]
+        log.info("request=disable(by %s) status=%s reason=%s detail=%s",
+                 who, r.status_code, body["reason"], body["detail"])
+        assert r.status_code == 403 and body["reason"] == "forbidden_role"
+        r = client.post(
+            "/accounts/bob/password",
+            headers={"x-auth-token": sess["token"]},
+            json={"new_password": "hijacked"},
+        )
+        body = r.json()["detail"]
+        log.info("request=change_password(by %s) status=%s reason=%s", who, r.status_code, body["reason"])
+        assert r.status_code == 403 and body["reason"] == "forbidden_role"
+    # 越权尝试不得产生任何效果：bob 未被停用、口令未被改
+    r = client.post("/login", json={"username": "bob", "password": "bob-pw"})
+    log.info("request=login(bob after blocked attempts) status=%s", r.status_code)
+    assert r.status_code == 200
+
+
+def test_http_admin_change_password_takes_effect():
+    """admin 改口令：操作生效，旧口令不能再登录，新口令可以，旧会话失效。"""
+    admin = login("root")
+    sess = login("bob")
+    r = client.post(
+        "/accounts/bob/password",
+        headers={"x-auth-token": admin["token"]},
+        json={"new_password": "bob-new-pw"},
+    )
+    log.info("request=admin change_password(bob) status=%s body=%s", r.status_code, r.json())
+    assert r.status_code == 200 and r.json()["allowed"]
+
+    r = client.get("/resource/r-bob", headers={"x-auth-token": sess["token"]})
+    log.info("request=read(old session after password change) reason=%s", r.json()["detail"]["reason"])
+    assert r.json()["detail"]["reason"] == "session_invalidated"
+
+    r = client.post("/login", json={"username": "bob", "password": "bob-pw"})
+    log.info("request=login(old password) reason=%s", r.json()["detail"]["reason"])
+    assert r.status_code == 401 and r.json()["detail"]["reason"] == "password_mismatch"
+
+    r = client.post("/login", json={"username": "bob", "password": "bob-new-pw"})
+    log.info("request=login(new password) status=%s", r.status_code)
+    assert r.status_code == 200
+
+    # 恢复口令，避免影响其他用例
+    r = client.post(
+        "/accounts/bob/password",
+        headers={"x-auth-token": admin["token"]},
+        json={"new_password": "bob-pw"},
+    )
+    assert r.status_code == 200

@@ -12,7 +12,7 @@ from typing import Optional
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-from app.access import can_read, can_write
+from app.access import can_manage_accounts, can_read, can_write
 from app.accounts import AccountStore
 from app.auth import AuthService
 from app.models import DenialReason, Resource, Role
@@ -92,6 +92,24 @@ def _session_view(session) -> dict:
     }
 
 
+def _require_admin(x_auth_token: Optional[str]):
+    """账号管理操作的守卫：必须已登录且具备 admin 角色。
+
+    拒绝原因可区分：未携带/无效凭据 -> 401（session_not_found 等），
+    已登录但角色不足 -> 403 forbidden_role。
+    """
+    if not x_auth_token:
+        raise _deny_http(DenialReason.SESSION_NOT_FOUND, "缺少凭据")
+    decision = auth.validate(x_auth_token)
+    if not decision.allowed:
+        raise _deny_http(decision.reason, decision.detail)
+    session = auth.get_active_session(x_auth_token)
+    access = can_manage_accounts(session)
+    if not access.allowed:
+        raise _deny_http(access.reason, access.detail)
+    return session
+
+
 @app.post("/login")
 def login(body: LoginBody):
     decision, session = auth.login(body.username, body.password)
@@ -119,8 +137,9 @@ def revoke(session_id: str):
 
 
 @app.post("/accounts/{username}/disable")
-def disable_account(username: str):
-    """停用账号：该账号既有会话全部立即失效（session_invalidated）。"""
+def disable_account(username: str, x_auth_token: Optional[str] = Header(default=None)):
+    """停用账号（仅 admin）：该账号既有会话全部立即失效（session_invalidated）。"""
+    _require_admin(x_auth_token)
     decision = accounts.set_enabled(username, False)
     if not decision.allowed:
         raise _deny_http(decision.reason, decision.detail)
@@ -128,8 +147,11 @@ def disable_account(username: str):
 
 
 @app.post("/accounts/{username}/password")
-def change_password(username: str, body: PasswordBody):
-    """修改口令：该账号既有会话全部立即失效（session_invalidated）。"""
+def change_password(
+    username: str, body: PasswordBody, x_auth_token: Optional[str] = Header(default=None)
+):
+    """修改口令（仅 admin）：该账号既有会话全部立即失效（session_invalidated）。"""
+    _require_admin(x_auth_token)
     decision = accounts.change_password(username, body.new_password)
     if not decision.allowed:
         raise _deny_http(decision.reason, decision.detail)

@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import secrets
-import threading
 import time
 import uuid
 from typing import Callable, Optional
@@ -22,8 +21,12 @@ from app.models import Decision, DenialReason, Session
 class AuthService:
     """内存会话服务。
 
-    并发模型：所有状态读取与变更都在同一把锁内完成，
-    因此刷新轮换、撤销、账号失效联动与受保护写操作在并发下结论确定。
+    并发模型：会话层与账号仓库共用同一把可重入锁（AccountStore.lock），
+    所有状态读取与变更都在该锁内完成，因此：
+    - 刷新轮换、撤销、账号失效联动与受保护写操作在并发下结论确定；
+    - 登录的"认证 + 签发会话"与"停用/改密"互斥：状态切换一旦返回，
+      之后完成的登录要么被 authenticate 拒绝，要么在签发前已看到新状态，
+      不可能留下仍可用的会话。
     判定优先级（会话级状态优先于凭据级状态）：
     撤销 > 账号失效 > 已轮换 > 已过期。
     """
@@ -39,7 +42,9 @@ class AuthService:
         self._ttl = ttl_seconds
         self._max_lifetime = max_lifetime_seconds
         self._clock = clock or time.monotonic
-        self._lock = threading.Lock()
+        # 与账号仓库共享同一把可重入锁：登录签发与账号状态切换互斥，
+        # 且锁内调用 AccountStore 方法（同一把 RLock）不会死锁。
+        self._lock = account_store.lock
         self._sessions: dict[str, Session] = {}
         # 所有签发过的凭据 -> 会话，用于区分"从未存在"与"已轮换"。
         self._token_index: dict[str, str] = {}
@@ -75,11 +80,17 @@ class AuthService:
     # ---- 公开接口 ----
 
     def login(self, username: str, password: str) -> tuple[Decision, Optional[Session]]:
-        """基于本地账号登录：口令由 AccountStore 校验，角色取自账号本身。"""
-        decision, account = self._accounts.authenticate(username, password)
-        if not decision.allowed:
-            return decision, None
+        """基于本地账号登录：口令由 AccountStore 校验，角色取自账号本身。
+
+        认证与签发在同一把锁内完成（authenticate 重入同一把 RLock），
+        与 set_enabled/change_password 互斥：停用或改密一旦返回成功，
+        之后完成的登录不可能再签发可用会话——要么认证阶段就被拒绝
+        （account_disabled / password_mismatch），要么根本来不及进入签发。
+        """
         with self._lock:
+            decision, account = self._accounts.authenticate(username, password)
+            if not decision.allowed:
+                return decision, None
             now = self._clock()
             session = Session(
                 session_id=uuid.uuid4().hex,
