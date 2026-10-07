@@ -119,8 +119,14 @@ def revoke(session_id: str):
 
 
 @app.post("/accounts/{username}/disable")
-def disable_account(username: str):
-    """停用账号：该账号既有会话全部立即失效（session_invalidated）。"""
+def disable_account(username: str, x_auth_token: Optional[str] = Header(default=None)):
+    """停用账号（仅管理员）：该账号既有会话全部立即失效（session_invalidated）。
+
+    未登录/凭据失效 -> 401（会话级原因）；已登录但非管理员 -> 403 admin_required。
+    """
+    decision, _ = auth.authorize_admin(x_auth_token)
+    if not decision.allowed:
+        raise _deny_http(decision.reason, decision.detail)
     decision = accounts.set_enabled(username, False)
     if not decision.allowed:
         raise _deny_http(decision.reason, decision.detail)
@@ -128,8 +134,18 @@ def disable_account(username: str):
 
 
 @app.post("/accounts/{username}/password")
-def change_password(username: str, body: PasswordBody):
-    """修改口令：该账号既有会话全部立即失效（session_invalidated）。"""
+def change_password(
+    username: str,
+    body: PasswordBody,
+    x_auth_token: Optional[str] = Header(default=None),
+):
+    """修改口令（仅管理员）：该账号既有会话全部立即失效（session_invalidated）。
+
+    未登录/凭据失效 -> 401（会话级原因）；已登录但非管理员 -> 403 admin_required。
+    """
+    decision, _ = auth.authorize_admin(x_auth_token)
+    if not decision.allowed:
+        raise _deny_http(decision.reason, decision.detail)
     decision = accounts.change_password(username, body.new_password)
     if not decision.allowed:
         raise _deny_http(decision.reason, decision.detail)

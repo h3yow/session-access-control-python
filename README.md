@@ -12,7 +12,7 @@ app/accounts.py  # AccountStore：本地账号、口令校验、失败限流锁�
 app/auth.py      # AuthService：登录、校验、刷新轮换、撤销、失效联动、受保护写操作
 app/access.py    # can_read / can_write：基于角色的资源访问判定（纯函数）
 main.py          # FastAPI 路由层（HTTP 演示，含演示用本地账号）
-tests/           # 生命周期、账号登录、失效联动、续期上限、访问矩阵、并发、HTTP 端到端
+tests/           # 生命周期、账号登录、失效联动（含并发风暴）、续期上限、访问矩阵、并发、管理鉴权、HTTP 端到端
 ```
 
 ## 本地账号模型
@@ -45,14 +45,22 @@ tests/           # 生命周期、账号登录、失效联动、续期上限、�
 
 ## 账号状态变化对既有会话的影响
 
-会话签发时记录账号当时的 `epoch`。账号被**停用**或**修改口令**后 `epoch` 递增，
-该账号此前签发的所有会话在下一次访问或续期时立即以 `session_invalidated` 失效——
-与普通的会话撤销（`session_revoked`）、自然过期（`session_expired`）可区分。
+会话签发时记录账号当时的 `epoch`。账号被**停用**或**修改口令**后 `epoch` 递增
+（停用还会置 `enabled=False`），该账号此前签发的所有会话在下一次访问或续期时立即以
+`session_invalidated` 失效——与普通的会话撤销（`session_revoked`）、自然过期
+（`session_expired`）、凭据被轮换（`token_rotated`）均可区分。
 
 - 失效对**访问和续期同样生效**，不会出现同一批旧凭据有的能用、有的不能用；
 - 会话级状态优先于凭据级状态：停用后即使凭据已轮换/已过期，也报 `session_invalidated`；
-- 状态切换与并发请求同时发生时，所有判定都在锁内完成：切换完成后不允许再有请求漏网成功
-  （见 `test_invalidation.py::test_concurrent_disable_no_request_slips_through`）。
+- **"认证 → 签发/续期"与"停用/改密"在同一把共享可重入锁（RLock）内全局串行**：
+  - 登录成功时在锁内取账号**快照**（`username/role/enabled/epoch` 定格）并立即签发，
+    状态切换无法插入"认证之后、签发之前"的窗口；
+  - 状态切换完成之后到达的登录直接被认证拒绝（停用 → `account_disabled`，
+    旧口令 → `password_mismatch`），切换之前签发的会话则靠 epoch 联动失效；
+  - 因此状态切换一旦完成，该账号**不存在任何仍然可用的会话/凭据**，
+    之后用旧凭据访问、续期一律 `session_invalidated`，用旧口令登录一律失败，结论一致；
+  - 见 `test_invalidation.py` 的两个并发风暴用例（停用/改密 × 并发登录/续期），
+    它们在修复前的代码上可稳定复现漏网会话。
 
 ## 会话生命周期与续期总时长上限
 
@@ -70,6 +78,22 @@ tests/           # 生命周期、账号登录、失效联动、续期上限、�
      不会同时留下多个有效会话。
 5. **撤销** `POST /revoke/{session_id}`：会话级失效，所有凭据返回 `session_revoked`。
 6. **过期**：`clock() >= expires_at` 即失效，返回 `session_expired`。
+
+## 账号管理操作的权限要求
+
+`POST /accounts/{username}/disable`（停用账号）与
+`POST /accounts/{username}/password`（修改口令）属于**管理操作**，
+必须携带一个**已登录且角色为 `admin`** 的会话凭据（`X-Auth-Token`）：
+
+- 未携带凭据、凭据从未签发/已过期/已轮换/已撤销、或会话因账号状态变化失效
+  → 401，沿用对应的会话级 `reason`（与"权限不够"明确区分）；
+- 凭据有效但角色是 `owner`/`viewer` → 403 `admin_required`，且**操作不产生任何效果**
+  （账号不会被停用，口令不会被改）；
+- admin 鉴权与停用/改密本身在同一临界区内串行，管理员自身会话不可能在
+  "鉴权通过"与"操作执行"之间被失效。
+
+服务层入口为 `AuthService.authorize_admin(token)`，返回结构化 `Decision`；
+HTTP 层的拒绝样例见 `test_api.py::test_http_admin_account_actions_require_admin_session`。
 
 ## 权限模型
 
@@ -107,6 +131,7 @@ tests/           # 生命周期、账号登录、失效联动、续期上限、�
 | `session_revoked` | 凭据所在会话已被撤销 | 401 |
 | `session_invalidated` | 账号停用/改密导致会话被强制失效 | 401 |
 | `session_max_age_exceeded` | 续期总时长已达上限，禁止续期 | 401 |
+| `admin_required` | 已登录但非管理员，无权执行停用/改口令等管理操作 | 403 |
 | `forbidden_role` | 角色能力不足（如 viewer 访问 private / 执行写） | 403 |
 | `not_owner` | 非管理员且不是目标资源的所有者 | 403 |
 | `csrf_missing` | 写操作缺少保护信息 | 403 |
@@ -143,13 +168,31 @@ curl -s -X POST localhost:8000/login -H 'content-type: application/json' \
 # 连续 3 次错误口令后，正确口令也会被锁定 30s -> 401 account_locked
 curl -s -X POST localhost:8000/login -H 'content-type: application/json' \
   -d '{"username":"alice","password":"wrong"}'
-# 停用账号后，既有会话访问/续期 -> 401 session_invalidated
+# 管理操作需要管理员登录：先以 root（admin）登录拿 token
+ROOT_TOKEN=$(curl -s -X POST localhost:8000/login -H 'content-type: application/json' \
+  -d '{"username":"root","password":"root-pw"}' | python -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+# 不带凭据/用普通账号调用 -> 401 session_not_found / 403 admin_required
 curl -s -X POST localhost:8000/accounts/alice/disable
-# 修改口令同样使既有会话失效
+# 停用账号后，既有会话访问/续期 -> 401 session_invalidated
+curl -s -X POST localhost:8000/accounts/alice/disable -H "x-auth-token: $ROOT_TOKEN"
+# 修改口令同样使既有会话失效（仅管理员）
 curl -s -X POST localhost:8000/accounts/alice/password \
-  -H 'content-type: application/json' -d '{"new_password":"new-pw"}'
+  -H "x-auth-token: $ROOT_TOKEN" -H 'content-type: application/json' \
+  -d '{"new_password":"new-pw"}'
+# 改密后旧口令登录 -> 401 password_mismatch；新口令可登录
+curl -s -X POST localhost:8000/login -H 'content-type: application/json' \
+  -d '{"username":"alice","password":"alice-pw"}'
 # 刷新（携带登录返回的 token）；旧 token 重放 -> 401 token_rotated
 curl -s -X POST localhost:8000/refresh -H "x-auth-token: <token>"
+```
+
+并发场景（停用/改密 × 并发登录/续期）可直接跑对应用例观察 INFO 日志中每条请求的
+输入与判定依据：
+
+```bash
+uv run pytest tests/test_invalidation.py -v
+# test_concurrent_logins_against_disable_leave_no_usable_session
+# test_concurrent_logins_against_password_change_leave_no_usable_session
 ```
 
 测试日志中每个用例都会打印**请求输入**（用户、角色、资源、操作编号、时间推进）与

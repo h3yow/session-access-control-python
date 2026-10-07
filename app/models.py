@@ -44,6 +44,8 @@ class DenialReason(enum.Enum):
     SESSION_INVALIDATED = "session_invalidated"
     # 续期总时长上限
     SESSION_MAX_AGE_EXCEEDED = "session_max_age_exceeded"
+    # 管理操作（停用账号、修改他人/账号口令）需要管理员权限
+    ADMIN_REQUIRED = "admin_required"
 
 
 @dataclass(frozen=True)
@@ -93,6 +95,20 @@ class Account:
     role: Role
     enabled: bool = True
     epoch: int = 0
+
+
+@dataclass(frozen=True)
+class AccountSnapshot:
+    """认证通过时在锁内定格的账号视图。
+
+    会话签发必须基于这份快照而非重新读取账号，
+    否则"认证"与"签发"之间可能插入停用/改密，产生漏网会话。
+    """
+
+    username: str
+    role: Role
+    enabled: bool
+    epoch: int
 
 
 @dataclass
